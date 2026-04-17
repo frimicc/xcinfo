@@ -22,6 +22,7 @@ let package = Package(
         .package(url: "https://github.com/getGuaka/Prompt.git", from: "0.0.0"),
         .package(url: "https://github.com/pointfreeco/swift-custom-dump", from: "1.1.0"),
         .package(url: "https://github.com/saagarjha/unxip", from: "3.0.0"),
+        .package(url: "https://github.com/xcodesOrg/swift-srp", revision: "543aa0122a0257b992f6c7d62d18a26e3dffb8fe"),
 //        .package(url: "https://github.com/Kitura/BlueSignals.git", from: "2.0.1")
     ],
     targets: [
@@ -69,7 +70,11 @@ let package = Package(
         ),
         .target(
             name: "OlympUs",
-            dependencies: ["XCIFoundation", "Prompt"]
+            dependencies: [
+                "XCIFoundation",
+                "Prompt",
+                .product(name: "SRP", package: "swift-srp"),
+            ]
         ),
     ]
 )

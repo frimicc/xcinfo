@@ -4,12 +4,16 @@
 //
 
 import Combine
+import CommonCrypto
+import Crypto
 import Foundation
 import Prompt
 import Rainbow
+import SRP
 import XCIFoundation
 
 public enum OlympUsError: Error {
+
     case missingSessionKey
     case signInRequestFailed
     case requestAuthentication
@@ -18,6 +22,11 @@ public enum OlympUsError: Error {
     case olympusSessionFailed
     case downloadAuthFailed
     case sessionInvalid
+    case invalidHashcash
+    case srpInitFailed
+    case srpInvalidServerKey
+    case srpError(String)
+
 }
 
 public enum OlympUsState: CaseIterable, CustomStringConvertible {
@@ -276,25 +285,60 @@ public class OlympUs {
         }
     }
 
-    // MARK: - Step 1: sign in -
+    // MARK: - Step 1: sign in (SRP) -
 
-    struct SignInRequest: Codable {
-        var accountName: String
-        var password: String
-        var rememberMe = true
+    private enum SRPAuthProtocol: String, Codable {
+
+        case s2k
+        case s2k_fo
+
     }
 
-    struct SignInResponse: Codable {
-        var authType: String
+    private struct SRPInitRequest: Encodable {
+
+        let a: String
+        let accountName: String
+        let protocols: [SRPAuthProtocol]
+
+    }
+
+    private struct SRPInitResponse: Decodable {
+
+        let iteration: Int
+        let salt: String
+        let b: String
+        let c: String
+        let `protocol`: String?
+
+    }
+
+    private struct SRPCompleteRequest: Encodable {
+
+        let accountName: String
+        let c: String
+        let m1: String
+        let m2: String
+        let rememberMe: Bool
+
+    }
+
+    private struct SignInResponse: Codable {
+
+        var authType: String?
+
     }
 
     private let signInURL = URL(string: "https://idmsa.apple.com/appleauth/auth/signin")!
+    private let srpInitURL = URL(string: "https://idmsa.apple.com/appleauth/auth/signin/init")!
+    private let srpCompleteURL = URL(string: "https://idmsa.apple.com/appleauth/auth/signin/complete?isRememberMeEnabled=false")!
 
     public struct AuthenticationAssets {
+
         var serviceKey: String?
         var scnt: String?
         var asid: String?
         var authenticationType: String?
+
     }
 
     public func signIn(
@@ -306,42 +350,285 @@ public class OlympUs {
             self.state = .signingIn
             self.session.configuration.httpCookieStorage?.removeCookies(since: Date(timeIntervalSinceReferenceDate: 0))
 
-            var request = URLRequest(url: self.signInURL)
-            request.httpMethod = "POST"
-            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.addValue("X-Requested-With", forHTTPHeaderField: "X-Requested-With")
-            request.addValue("application/json, text/javascript", forHTTPHeaderField: "Accept")
-            request.addValue(serviceKey, forHTTPHeaderField: "X-Apple-Widget-Key")
+            let srpClient = SRPClient(configuration: SRPConfiguration<SHA256>(.N2048))
+            let clientKeys = srpClient.generateKeys()
+            let clientPublicKey = clientKeys.public
 
-            let body = SignInRequest(accountName: accountName, password: password)
-            let data = try? JSONEncoder().encode(body)
-
-            var authenticationAssets = AuthenticationAssets(serviceKey: serviceKey)
-            request.httpBody = data
-            self.session
-                .dataTaskPublisher(for: request)
-                .map {
-                    if
-                        let httpResponse = $0.response as? HTTPURLResponse,
-                        let scnt = httpResponse.allHeaderFields["scnt"] as? String,
-                        let asid = httpResponse.allHeaderFields["X-Apple-ID-Session-Id"] as? String
-                    {
-                        authenticationAssets.asid = asid
-                        authenticationAssets.scnt = scnt
-                    }
-                    return $0.data
+            self.loadHashcash(accountName: accountName, serviceKey: serviceKey)
+                .flatMap { hashcash -> Future<(SRPInitResponse, String), OlympUsError> in
+                    self.srpInit(
+                        serviceKey: serviceKey,
+                        accountName: accountName,
+                        clientPublicKey: Data(clientPublicKey.bytes).base64EncodedString()
+                    )
+                    .map { ($0, hashcash) }
+                    .eraseToAnyPublisher()
+                    .asFuture()
                 }
-                .decode(type: SignInResponse.self, decoder: JSONDecoder())
-                .sink(receiveCompletion: { completion in
-                    if case .failure = completion {
-                        promise(.failure(.signInRequestFailed))
+                .flatMap { initResponse, hashcash -> Future<AuthenticationAssets, OlympUsError> in
+                    do {
+                        return try self.completeSRPSignIn(
+                            srpClient: srpClient,
+                            clientKeys: clientKeys,
+                            clientPublicKey: clientPublicKey,
+                            initResponse: initResponse,
+                            accountName: accountName,
+                            password: password,
+                            serviceKey: serviceKey,
+                            hashcash: hashcash
+                        )
+                    } catch let error as OlympUsError {
+                        return Future { $0(.failure(error)) }
+                    } catch {
+                        return Future { $0(.failure(.srpError(error.localizedDescription))) }
                     }
-                }, receiveValue: { response in
-                    authenticationAssets.authenticationType = response.authType
-                    promise(.success(authenticationAssets))
+                }
+                .sink(receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        promise(.failure(error))
+                    }
+                }, receiveValue: { assets in
+                    promise(.success(assets))
                 })
                 .store(in: &self.disposeBag)
         }
+    }
+
+    // MARK: - SRP Helpers -
+
+    private func loadHashcash(accountName: String, serviceKey: String) -> Future<String, OlympUsError> {
+        Future { promise in
+            var request = URLRequest(url: self.signInURL)
+            request.httpMethod = "GET"
+            request.addValue("application/json", forHTTPHeaderField: "Accept")
+            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.addValue(serviceKey, forHTTPHeaderField: "X-Apple-Widget-Key")
+
+            self.session
+                .dataTaskPublisher(for: request)
+                .sink(receiveCompletion: { completion in
+                    if case .failure = completion {
+                        promise(.failure(.invalidHashcash))
+                    }
+                }, receiveValue: { output in
+                    guard
+                        let httpResponse = output.response as? HTTPURLResponse,
+                        let bitString = httpResponse.allHeaderFields["X-Apple-HC-Bits"] as? String,
+                        let bits = UInt(bitString),
+                        let challenge = httpResponse.allHeaderFields["X-Apple-HC-Challenge"] as? String,
+                        let hashcash = Hashcash().mint(resource: challenge, bits: bits)
+                    else {
+                        promise(.failure(.invalidHashcash))
+                        return
+                    }
+                    promise(.success(hashcash))
+                })
+                .store(in: &self.disposeBag)
+        }
+    }
+
+    private func srpInit(
+        serviceKey: String,
+        accountName: String,
+        clientPublicKey: String
+    ) -> Future<SRPInitResponse, OlympUsError> {
+        Future { promise in
+            var request = URLRequest(url: self.srpInitURL)
+            request.httpMethod = "POST"
+            request.addValue("application/json", forHTTPHeaderField: "Accept")
+            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.addValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+            request.addValue(serviceKey, forHTTPHeaderField: "X-Apple-Widget-Key")
+
+            let body = SRPInitRequest(
+                a: clientPublicKey,
+                accountName: accountName,
+                protocols: [.s2k, .s2k_fo]
+            )
+            request.httpBody = try? JSONEncoder().encode(body)
+
+            self.session
+                .dataTaskPublisher(for: request)
+                .map { $0.data }
+                .decode(type: SRPInitResponse.self, decoder: JSONDecoder())
+                .sink(receiveCompletion: { completion in
+                    if case .failure = completion {
+                        promise(.failure(.srpInitFailed))
+                    }
+                }, receiveValue: { response in
+                    promise(.success(response))
+                })
+                .store(in: &self.disposeBag)
+        }
+    }
+
+    private func completeSRPSignIn(
+        srpClient: SRPClient<SHA256>,
+        clientKeys: SRPKeyPair,
+        clientPublicKey: SRPKey,
+        initResponse: SRPInitResponse,
+        accountName: String,
+        password: String,
+        serviceKey: String,
+        hashcash: String
+    ) throws -> Future<AuthenticationAssets, OlympUsError> {
+        guard let decodedB = Data(base64Encoded: initResponse.b) else {
+            throw OlympUsError.srpInvalidServerKey
+        }
+        guard let decodedSalt = Data(base64Encoded: initResponse.salt) else {
+            throw OlympUsError.srpInvalidServerKey
+        }
+
+        let isFallback = initResponse.protocol == "s2k_fo"
+        guard let encryptedPassword = pbkdf2(
+            password: password,
+            saltData: decodedSalt,
+            keyByteCount: 32,
+            prf: CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+            rounds: initResponse.iteration,
+            skipPreHash: isFallback
+        ) else {
+            throw OlympUsError.srpError("PBKDF2 key derivation failed")
+        }
+
+        let sharedSecret = try srpClient.calculateSharedSecret(
+            password: encryptedPassword,
+            salt: [UInt8](decodedSalt),
+            clientKeys: clientKeys,
+            serverPublicKey: SRPKey([UInt8](decodedB))
+        )
+
+        let m1 = srpClient.calculateClientProof(
+            username: accountName,
+            salt: [UInt8](decodedSalt),
+            clientPublicKey: clientPublicKey,
+            serverPublicKey: SRPKey([UInt8](decodedB)),
+            sharedSecret: SRPKey(sharedSecret.bytes)
+        )
+
+        let m2 = srpClient.calculateServerProof(
+            clientPublicKey: clientPublicKey,
+            clientProof: m1,
+            sharedSecret: SRPKey([UInt8](sharedSecret.bytes))
+        )
+
+        return srpComplete(
+            serviceKey: serviceKey,
+            hashcash: hashcash,
+            accountName: accountName,
+            c: initResponse.c,
+            m1: Data(m1).base64EncodedString(),
+            m2: Data(m2).base64EncodedString()
+        )
+    }
+
+    private func srpComplete(
+        serviceKey: String,
+        hashcash: String,
+        accountName: String,
+        c: String,
+        m1: String,
+        m2: String
+    ) -> Future<AuthenticationAssets, OlympUsError> {
+        Future { promise in
+            var request = URLRequest(url: self.srpCompleteURL)
+            request.httpMethod = "POST"
+            request.addValue("application/json", forHTTPHeaderField: "Accept")
+            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.addValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+            request.addValue(serviceKey, forHTTPHeaderField: "X-Apple-Widget-Key")
+            request.addValue(hashcash, forHTTPHeaderField: "X-Apple-HC")
+
+            let body = SRPCompleteRequest(
+                accountName: accountName,
+                c: c,
+                m1: m1,
+                m2: m2,
+                rememberMe: false
+            )
+            request.httpBody = try? JSONEncoder().encode(body)
+
+            var authenticationAssets = AuthenticationAssets(serviceKey: serviceKey)
+
+            self.session
+                .dataTaskPublisher(for: request)
+                .tryMap { output -> AuthenticationAssets in
+                    guard let httpResponse = output.response as? HTTPURLResponse else {
+                        throw OlympUsError.signInRequestFailed
+                    }
+
+                    if let scnt = httpResponse.allHeaderFields["scnt"] as? String,
+                       let asid = httpResponse.allHeaderFields["X-Apple-ID-Session-Id"] as? String
+                    {
+                        authenticationAssets.scnt = scnt
+                        authenticationAssets.asid = asid
+                    }
+
+                    switch httpResponse.statusCode {
+                    case 200, 409:
+                        if let signInResponse = try? JSONDecoder().decode(SignInResponse.self, from: output.data) {
+                            authenticationAssets.authenticationType = signInResponse.authType
+                        }
+                        return authenticationAssets
+                    case 401:
+                        throw OlympUsError.signInRequestFailed
+                    default:
+                        throw OlympUsError.srpError("Unexpected sign-in response: HTTP \(httpResponse.statusCode)")
+                    }
+                }
+                .sink(receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        promise(.failure(error as? OlympUsError ?? .signInRequestFailed))
+                    }
+                }, receiveValue: { assets in
+                    promise(.success(assets))
+                })
+                .store(in: &self.disposeBag)
+        }
+    }
+
+    private func sha256(data: Data) -> Data {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return Data(hash)
+    }
+
+    private func pbkdf2(
+        password: String,
+        saltData: Data,
+        keyByteCount: Int,
+        prf: CCPseudoRandomAlgorithm,
+        rounds: Int,
+        skipPreHash: Bool = false
+    ) -> Data? {
+        guard let passwordData = password.data(using: .utf8) else { return nil }
+        let hashedPasswordData = skipPreHash ? passwordData : sha256(data: passwordData)
+
+        var derivedKeyData = Data(repeating: 0, count: keyByteCount)
+        let derivedCount = derivedKeyData.count
+        let derivationStatus: Int32 = derivedKeyData.withUnsafeMutableBytes { derivedKeyBytes in
+            let keyBuffer = derivedKeyBytes.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            return saltData.withUnsafeBytes { saltBytes -> Int32 in
+                let saltBuffer = saltBytes.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return hashedPasswordData.withUnsafeBytes { hashedPasswordBytes -> Int32 in
+                    let passwordBuffer = hashedPasswordBytes.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    return CCKeyDerivationPBKDF(
+                        CCPBKDFAlgorithm(kCCPBKDF2),
+                        passwordBuffer,
+                        hashedPasswordData.count,
+                        saltBuffer,
+                        saltData.count,
+                        prf,
+                        UInt32(rounds),
+                        keyBuffer,
+                        derivedCount
+                    )
+                }
+            }
+        }
+        return derivationStatus == kCCSuccess ? derivedKeyData : nil
     }
 
     // MARK: - Step 2: request auth -
@@ -664,4 +951,26 @@ extension OlympUs {
     private func removeCookies() {
         UserDefaults.standard.removeObject(forKey: "cookies")
     }
+
+}
+
+extension Publisher {
+
+    func asFuture() -> Future<Output, Failure> {
+        var cancellable: AnyCancellable?
+        return Future { promise in
+            cancellable = self.sink(
+                receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        promise(.failure(error))
+                    }
+                    _ = cancellable
+                },
+                receiveValue: { value in
+                    promise(.success(value))
+                }
+            )
+        }
+    }
+
 }
