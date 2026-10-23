@@ -7,7 +7,7 @@ export exec_prefix
 export bindir
 
 all:
-	swift build -c release --arch arm64 --arch x86_64
+	swift build -c release --arch arm64
 
 .PHONY: all install clean cleanup
 
