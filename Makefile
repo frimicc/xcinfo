@@ -13,7 +13,7 @@ all:
 
 install:
 	install -d $(bindir)
-	install -m 0755 .build/apple/Products/Release/xcinfo $(bindir)
+	install -m 0755 .build/out/Products/Release/xcinfo $(bindir)
 
 clean:
 	swift package clean

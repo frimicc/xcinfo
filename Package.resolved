@@ -95,7 +95,6 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xcodesOrg/swift-srp",
       "state" : {
-        "branch" : "main",
         "revision" : "543aa0122a0257b992f6c7d62d18a26e3dffb8fe"
       }
     },
